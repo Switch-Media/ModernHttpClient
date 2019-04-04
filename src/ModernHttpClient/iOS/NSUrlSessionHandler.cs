@@ -71,6 +71,9 @@ namespace ModernHttpClient
             else if ((sp & SecurityProtocolType.Tls12) != 0)
                 configuration.TLSMinimumSupportedProtocol = SslProtocol.Tls_1_2;
 
+            INSUrlSessionDelegate sessionDelegate = new DataTaskDelegate (this);
+            session = NSUrlSession.FromConfiguration (NSUrlSessionConfiguration.DefaultSessionConfiguration, sessionDelegate, null);
+
             this.throwOnCaptiveNetwork = throwOnCaptiveNetwork;
             this.customSSLVerification = customSSLVerification;
 
