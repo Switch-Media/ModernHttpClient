@@ -5,8 +5,6 @@ NUSPEC_FILE ?= ModernHttpClient.nuspec
 
 all: ModernHttpClient.iOS64.dll ModernHttpClient.Android.dll ModernHttpClient.Portable.dll
 
-release-pack: version-bump package
-
 package: ModernHttpClient.iOS64.dll ModernHttpClient.Android.dll ModernHttpClient.Portable.dll
 	nuget pack
 	mv modernhttpclient*.nupkg ~/.local/share/NuGet/Cache/
@@ -30,11 +28,3 @@ clean:
 	$(MDTOOL) build -t:Clean ModernHttpClient.sln
 	rm *.dll
 	rm -rf build
-	
-version-bump:
-	$(eval version = $(shell grep '<version>' $(NUSPEC_FILE) | sed "s@.*<version>\(.*\)</version>.*@\1@"))
-	$(eval majorMinor = $(shell echo $(version) | rev | cut -d'.' -f2- | rev))
-	$(eval buildNumber = $(shell echo $(version) | rev | cut -d'.' -f 1 | rev))
-	$(eval newVersion = $(majorMinor).$(shell expr $(buildNumber) + 1))
-	@echo version updated to $(newVersion)
-	$(shell xmlstarlet ed -L -N N="http://schemas.microsoft.com/packaging/2011/08/nuspec.xsd" -u '/N:package/N:metadata/N:version' -v $(newVersion) $(NUSPEC_FILE))
