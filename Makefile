@@ -1,5 +1,4 @@
 MDTOOL ?= /Applications/Visual\ Studio.app/Contents/MacOS/vstool
-NUSPEC_FILE ?= ModernHttpClient.nuspec
 
 .PHONY: all clean
 
