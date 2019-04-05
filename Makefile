@@ -6,7 +6,7 @@ all: ModernHttpClient.iOS64.dll ModernHttpClient.Android.dll ModernHttpClient.Po
 
 package: ModernHttpClient.iOS64.dll ModernHttpClient.Android.dll ModernHttpClient.Portable.dll
 	nuget pack
-	mv modernhttpclient*.nupkg ~/.local/share/NuGet/Cache/
+	mv modernhttpclient*.nupkg ./build/
 
 ModernHttpClient.Android.dll: 
 	$(MDTOOL) build -c:Release ./src/ModernHttpClient/ModernHttpClient.Android.csproj
