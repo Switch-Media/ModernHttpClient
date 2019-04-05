@@ -18,7 +18,7 @@
       </group>
     </dependencies>
   </metadata>
-  
+
   <files>
     <file src="build/**/*.*" target="lib" />
   </files>
