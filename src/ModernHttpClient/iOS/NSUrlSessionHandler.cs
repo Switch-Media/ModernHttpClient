@@ -54,20 +54,25 @@ namespace ModernHttpClient
         public bool DisableCaching { get; set; }
 
         public NativeMessageHandler(): this(false, false) { }
-        public NativeMessageHandler(bool throwOnCaptiveNetwork, bool customSSLVerification, NativeCookieHandler cookieHandler = null, SslProtocol? minimumSSLProtocol = null)
+        public NativeMessageHandler(bool throwOnCaptiveNetwork, bool customSSLVerification, NativeCookieHandler cookieHandler = null)
         {
             var configuration = NSUrlSessionConfiguration.DefaultSessionConfiguration;
 
             // System.Net.ServicePointManager.SecurityProtocol provides a mechanism for specifying supported protocol types
             // for System.Net. Since iOS only provides an API for a minimum and maximum protocol we are not able to port
             // this configuration directly and instead use the specified minimum value when one is specified.
-            if (minimumSSLProtocol.HasValue) {
-                configuration.TLSMinimumSupportedProtocol = minimumSSLProtocol.Value;
-            }
+            var sp = ServicePointManager.SecurityProtocol;
+            if ((sp & SecurityProtocolType.Ssl3) != 0)
+                configuration.TLSMinimumSupportedProtocol = SslProtocol.Ssl_3_0;
+            else if ((sp & SecurityProtocolType.Tls) != 0)
+                configuration.TLSMinimumSupportedProtocol = SslProtocol.Tls_1_0;
+            else if ((sp & SecurityProtocolType.Tls11) != 0)
+                configuration.TLSMinimumSupportedProtocol = SslProtocol.Tls_1_1;
+            else if ((sp & SecurityProtocolType.Tls12) != 0)
+                configuration.TLSMinimumSupportedProtocol = SslProtocol.Tls_1_2;
 
-            session = NSUrlSession.FromConfiguration(
-                NSUrlSessionConfiguration.DefaultSessionConfiguration, 
-                new DataTaskDelegate(this), null);
+            INSUrlSessionDelegate sessionDelegate = new DataTaskDelegate (this);
+            session = NSUrlSession.FromConfiguration (NSUrlSessionConfiguration.DefaultSessionConfiguration, sessionDelegate, null);
 
             this.throwOnCaptiveNetwork = throwOnCaptiveNetwork;
             this.customSSLVerification = customSSLVerification;
