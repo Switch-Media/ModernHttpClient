@@ -8,3 +8,4 @@ build/
 packages
 .vs
 *Resource.designer.cs
+*ViewController.designer.cs
