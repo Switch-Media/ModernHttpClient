@@ -6,9 +6,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Net.Security;
 using System.Security.Cryptography.X509Certificates;
-using System.Text.RegularExpressions;
 using ModernHttpClient.CoreFoundation;
 using ModernHttpClient.Foundation;
 
@@ -35,27 +33,27 @@ namespace ModernHttpClient
 
     public class NativeMessageHandler : HttpClientHandler
     {
-        readonly NSUrlSession session;
+        readonly Lazy<NSUrlSession> session;
+        readonly Lazy<CertificatePinner> certificatePinner;
+        private X509Certificate2Collection trustedCertificates;
 
-        readonly Dictionary<NSUrlSessionTask, InflightOperation> inflightRequests = 
+        readonly Dictionary<NSUrlSessionTask, InflightOperation> inflightRequests =
             new Dictionary<NSUrlSessionTask, InflightOperation>();
 
-        readonly Dictionary<HttpRequestMessage, ProgressDelegate> registeredProgressCallbacks = 
+        readonly Dictionary<HttpRequestMessage, ProgressDelegate> registeredProgressCallbacks =
             new Dictionary<HttpRequestMessage, ProgressDelegate>();
 
         readonly Dictionary<string, string> headerSeparators =
-            new Dictionary<string, string>(){ 
+            new Dictionary<string, string>(){
                 {"User-Agent", " "}
             };
 
-        readonly bool throwOnCaptiveNetwork;
-        readonly bool customSSLVerification;
-
         public bool DisableCaching { get; set; }
 
-        public NativeMessageHandler(): this(false, false) { }
-        public NativeMessageHandler(bool throwOnCaptiveNetwork, bool customSSLVerification, NativeCookieHandler cookieHandler = null)
+        public NativeMessageHandler()
         {
+            session = new Lazy<NSUrlSession>(GetSessionInstance);
+            certificatePinner = new Lazy<CertificatePinner>(() => new CertificatePinner());
             var configuration = NSUrlSessionConfiguration.DefaultSessionConfiguration;
 
             // System.Net.ServicePointManager.SecurityProtocol provides a mechanism for specifying supported protocol types
@@ -71,16 +69,42 @@ namespace ModernHttpClient
             else if ((sp & SecurityProtocolType.Tls12) != 0)
                 configuration.TLSMinimumSupportedProtocol = SslProtocol.Tls_1_2;
 
-            INSUrlSessionDelegate sessionDelegate = new DataTaskDelegate (this);
-            session = NSUrlSession.FromConfiguration (NSUrlSessionConfiguration.DefaultSessionConfiguration, sessionDelegate, null);
-
-            this.throwOnCaptiveNetwork = throwOnCaptiveNetwork;
-            this.customSSLVerification = customSSLVerification;
-
             this.DisableCaching = false;
         }
 
-        string getHeaderSeparator(string name)
+        private NSUrlSession GetSessionInstance()
+        {
+            INSUrlSessionDelegate sessionDelegate = new DataTaskDelegate(this, certificatePinner.IsValueCreated ? certificatePinner.Value : null, trustedCertificates);
+            return NSUrlSession.FromConfiguration(NSUrlSessionConfiguration.DefaultSessionConfiguration, sessionDelegate, null);
+        }
+
+        /// <summary>
+        /// Set certificates for the trusted Root Certificate Authorities (iOS implementation)
+        /// </summary>
+        /// <param name="certificates">Certificates for the CAs to trust</param>
+        public void SetTrustedCertificates(params byte[][] certificates)
+        {
+            if (certificates.Length == 0) {
+                trustedCertificates = null;
+                return;
+            }
+            trustedCertificates = new X509Certificate2Collection();
+            foreach (var cert in certificates) {
+                trustedCertificates.Import(cert);
+            }
+        }
+
+        /// <summary>
+        /// Add certificate pins for a given hostname (iOS implementation)
+        /// </summary>
+        /// <param name="hostname">The hostname</param>
+        /// <param name="pins">The array of certifiate pins (example of pin string: "sha256/fiKY8VhjQRb2voRmVXsqI0xPIREcwOVhpexrplrlqQY=")</param>
+        public void SetCertificatePinner(string hostname, string[] pins)
+        {
+            certificatePinner.Value.AddPins(hostname, pins);
+        }
+
+        private string GetHeaderSeparator(string name)
         {
             if (headerSeparators.ContainsKey(name)) {
                 return headerSeparators[name];
@@ -99,7 +123,7 @@ namespace ModernHttpClient
             registeredProgressCallbacks[request] = callback;
         }
 
-        ProgressDelegate getAndRemoveCallbackFromRegister(HttpRequestMessage request)
+        private ProgressDelegate GetAndRemoveCallbackFromRegister(HttpRequestMessage request)
         {
             ProgressDelegate emptyDelegate = delegate { };
 
@@ -134,7 +158,7 @@ namespace ModernHttpClient
                 Url = NSUrl.FromString(request.RequestUri.AbsoluteUri),
             };
 
-            var op = session.CreateDataTask(rq);
+            var op = session.Value.CreateDataTask(rq);
 
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -158,15 +182,19 @@ namespace ModernHttpClient
         class DataTaskDelegate : NSUrlSessionDataDelegate
         {
             NativeMessageHandler This { get; set; }
+            readonly CertificatePinner _certificatePinner;
+            readonly X509Certificate2Collection _trustedCertificates;
 
-            public DataTaskDelegate(NativeMessageHandler that)
+            public DataTaskDelegate(NativeMessageHandler that, CertificatePinner certificatePinner, X509Certificate2Collection trustedRoots)
             {
                 this.This = that;
+                _certificatePinner = certificatePinner;
+                _trustedCertificates = trustedRoots;
             }
 
             public override void DidReceiveResponse(NSUrlSession session, NSUrlSessionDataTask dataTask, NSUrlResponse response, Action<NSUrlSessionResponseDisposition> completionHandler)
             {
-                var data = getResponseForTask(dataTask);
+                var data = GetResponseForTask(dataTask);
 
                 try {
                     if (data.CancellationToken.IsCancellationRequested) {
@@ -176,20 +204,15 @@ namespace ModernHttpClient
                     var resp = (NSHttpUrlResponse)response;
                     var req = data.Request;
 
-                    if (This.throwOnCaptiveNetwork && req.RequestUri.Host != resp.Url.Host) {
-                        throw new CaptiveNetworkException(req.RequestUri, new Uri(resp.Url.ToString()));
-                    }
-
                     var content = new CancellableStreamContent(data.ResponseBody, () => {
                         if (!data.IsCompleted) {
                             dataTask.Cancel();
                         }
                         data.IsCompleted = true;
-
                         data.ResponseBody.SetException(new OperationCanceledException());
-                    });
-
-                    content.Progress = data.Progress;
+                    }) {
+                        Progress = data.Progress
+                    };
 
                     // NB: The double cast is because of a Xamarin compiler bug
                     int status = (int)resp.StatusCode;
@@ -199,7 +222,7 @@ namespace ModernHttpClient
                     };
                     ret.RequestMessage.RequestUri = new Uri(resp.Url.AbsoluteString);
 
-                    foreach(var v in resp.AllHeaderFields) {
+                    foreach (var v in resp.AllHeaderFields) {
                         // NB: Cocoa trolling us so hard by giving us back dummy
                         // dictionary entries
                         if (v.Key == null || v.Value == null) continue;
@@ -216,19 +239,19 @@ namespace ModernHttpClient
                 completionHandler(NSUrlSessionResponseDisposition.Allow);
             }
 
-            public override void WillCacheResponse (NSUrlSession session, NSUrlSessionDataTask dataTask,
+            public override void WillCacheResponse(NSUrlSession session, NSUrlSessionDataTask dataTask,
                 NSCachedUrlResponse proposedResponse, Action<NSCachedUrlResponse> completionHandler)
             {
-                completionHandler (This.DisableCaching ? null : proposedResponse);
+                completionHandler(This.DisableCaching ? null : proposedResponse);
             }
 
-            public override void DidCompleteWithError (NSUrlSession session, NSUrlSessionTask task, NSError error)
+            public override void DidCompleteWithError(NSUrlSession session, NSUrlSessionTask task, NSError error)
             {
-                var data = getResponseForTask(task);
+                var data = GetResponseForTask(task);
                 data.IsCompleted = true;
 
                 if (error != null) {
-                    var ex = createExceptionForNSError(error);
+                    var ex = CreateExceptionForNSError(error);
 
                     // Pass the exception to the response
                     data.FutureResponse.TrySetException(ex);
@@ -243,9 +266,9 @@ namespace ModernHttpClient
                 }
             }
 
-            public override void DidReceiveData (NSUrlSession session, NSUrlSessionDataTask dataTask, NSData byteData)
+            public override void DidReceiveData(NSUrlSession session, NSUrlSessionDataTask dataTask, NSData byteData)
             {
-                var data = getResponseForTask(dataTask);
+                var data = GetResponseForTask(dataTask);
                 var bytes = byteData.ToArray();
 
                 // NB: If we're cancelled, we still might have one more chunk 
@@ -255,19 +278,15 @@ namespace ModernHttpClient
                 data.ResponseBody.AddByteArray(bytes);
             }
 
-            InflightOperation getResponseForTask(NSUrlSessionTask task)
+            private InflightOperation GetResponseForTask(NSUrlSessionTask task)
             {
                 lock (This.inflightRequests) {
                     return This.inflightRequests[task];
                 }
             }
 
-            static readonly Regex cnRegex = new Regex(@"CN\s*=\s*([^,]*)", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Singleline);
-
             public override void DidReceiveChallenge(NSUrlSession session, NSUrlSessionTask task, NSUrlAuthenticationChallenge challenge, Action<NSUrlSessionAuthChallengeDisposition, NSUrlCredential> completionHandler)
             {
-               
-
                 if (challenge.ProtectionSpace.AuthenticationMethod == NSUrlProtectionSpace.AuthenticationMethodNTLM) {
                     NetworkCredential credentialsToUse;
 
@@ -275,7 +294,7 @@ namespace ModernHttpClient
                         if (This.Credentials is NetworkCredential) {
                             credentialsToUse = (NetworkCredential)This.Credentials;
                         } else {
-                            var uri = this.getResponseForTask(task).Request.RequestUri;
+                            var uri = GetResponseForTask(task).Request.RequestUri;
                             credentialsToUse = This.Credentials.GetCredential(uri, "NTLM");
                         }
                         var credential = new NSUrlCredential(credentialsToUse.UserName, credentialsToUse.Password, NSUrlCredentialPersistence.ForSession);
@@ -284,78 +303,29 @@ namespace ModernHttpClient
                     return;
                 }
 
-                if (!This.customSSLVerification) {
-                    goto doDefault;
+                if (challenge.ProtectionSpace.AuthenticationMethod == NSUrlProtectionSpace.AuthenticationMethodServerTrust) {
+                    challenge.ProtectionSpace.ServerSecTrust.SetAnchorCertificates(_trustedCertificates);
+
+                    string hostname = task.CurrentRequest.Url.Host;
+                    if (_certificatePinner != null && _certificatePinner.HasPin(hostname)) {
+                        var serverTrust = challenge.ProtectionSpace.ServerSecTrust;
+                        var status = serverTrust.Evaluate();
+                        if (status == SecTrustResult.Proceed || status == SecTrustResult.Unspecified) {
+                            var serverCertificate = serverTrust[0];
+                            var x509Certificate = serverCertificate.ToX509Certificate2();
+                            var derEncoded = x509Certificate.Export(X509ContentType.Cert);
+                            if (_certificatePinner.Check(hostname, derEncoded)) {
+                                completionHandler(NSUrlSessionAuthChallengeDisposition.UseCredential, NSUrlCredential.FromTrust(serverTrust));
+                            } else {
+                                completionHandler(NSUrlSessionAuthChallengeDisposition.CancelAuthenticationChallenge, null);
+                            }
+                            return;
+                        }
+                    }
                 }
 
-                if (challenge.ProtectionSpace.AuthenticationMethod != "NSURLAuthenticationMethodServerTrust") {
-                    goto doDefault;
-                }
-
-                if (ServicePointManager.ServerCertificateValidationCallback == null) {
-                    goto doDefault;
-                }
-
-                // Convert Mono Certificates to .NET certificates and build cert 
-                // chain from root certificate
-                var serverCertChain = challenge.ProtectionSpace.ServerSecTrust;
-                var chain = new X509Chain();
-                X509Certificate2 root = null;
-                var errors = SslPolicyErrors.None;
-
-                if (serverCertChain == null || serverCertChain.Count == 0) { 
-                    errors = SslPolicyErrors.RemoteCertificateNotAvailable;
-                    goto sslErrorVerify;
-                }
-
-                if (serverCertChain.Count == 1) {
-                    errors = SslPolicyErrors.RemoteCertificateChainErrors;
-                    goto sslErrorVerify;
-                }
-
-                var netCerts = Enumerable.Range(0, serverCertChain.Count)
-                    .Select(x => serverCertChain[x].ToX509Certificate2())
-                    .ToArray();
-
-                for (int i = 1; i < netCerts.Length; i++) {
-                    chain.ChainPolicy.ExtraStore.Add(netCerts[i]);
-                }
-
-                root = netCerts[0];
-
-                chain.ChainPolicy.RevocationFlag = X509RevocationFlag.EntireChain;
-                chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-                chain.ChainPolicy.UrlRetrievalTimeout = new TimeSpan(0, 1, 0);
-                chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority;
-
-                if (!chain.Build(root)) {
-                    errors = SslPolicyErrors.RemoteCertificateChainErrors;
-                    goto sslErrorVerify;
-                }
-
-                var subject = root.Subject;
-                var subjectCn = cnRegex.Match(subject).Groups[1].Value;
-
-                if (String.IsNullOrWhiteSpace(subjectCn) || !Utility.MatchHostnameToPattern(task.CurrentRequest.Url.Host, subjectCn)) {
-                    errors = SslPolicyErrors.RemoteCertificateNameMismatch;
-                    goto sslErrorVerify;
-                }
-
-            sslErrorVerify:
-                var hostname = task.CurrentRequest.Url.Host;
-                bool result = ServicePointManager.ServerCertificateValidationCallback(hostname, root, chain, errors);
-                if (result) {
-                    completionHandler(
-                        NSUrlSessionAuthChallengeDisposition.UseCredential,
-                        NSUrlCredential.FromTrust(challenge.ProtectionSpace.ServerSecTrust));
-                } else {
-                    completionHandler(NSUrlSessionAuthChallengeDisposition.CancelAuthenticationChallenge, null);
-                }
-                return;
-
-            doDefault:
                 completionHandler(NSUrlSessionAuthChallengeDisposition.PerformDefaultHandling, challenge.ProposedCredential);
-                return;
+
             }
 
             public override void WillPerformHttpRedirection(NSUrlSession session, NSUrlSessionTask task, NSHttpUrlResponse response, NSUrlRequest newRequest, Action<NSUrlRequest> completionHandler)
@@ -364,7 +334,7 @@ namespace ModernHttpClient
                 completionHandler(nextRequest);
             }
 
-            static Exception createExceptionForNSError(NSError error)
+            private static Exception CreateExceptionForNSError(NSError error)
             {
                 var ret = default(Exception);
                 var webExceptionStatus = WebExceptionStatus.UnknownError;
@@ -385,75 +355,75 @@ namespace ModernHttpClient
                     // Apple docs: https://developer.apple.com/library/mac/documentation/Cocoa/Reference/Foundation/Miscellaneous/Foundation_Constants/index.html#//apple_ref/doc/constant_group/URL_Loading_System_Error_Codes
                     // .NET docs: http://msdn.microsoft.com/en-us/library/system.net.webexceptionstatus(v=vs.110).aspx
                     switch (urlError) {
-                    case NSUrlErrorExtended.Cancelled:
-                    case NSUrlErrorExtended.UserCancelledAuthentication:
-                        // No more processing is required so just return.
-                        return new OperationCanceledException(error.LocalizedDescription, innerException);
-                    case NSUrlErrorExtended.BadURL:
-                    case NSUrlErrorExtended.UnsupportedURL:
-                    case NSUrlErrorExtended.CannotConnectToHost:
-                    case NSUrlErrorExtended.ResourceUnavailable:
-                    case NSUrlErrorExtended.NotConnectedToInternet:
-                    case NSUrlErrorExtended.UserAuthenticationRequired:
-                    case NSUrlErrorExtended.InternationalRoamingOff:
-                    case NSUrlErrorExtended.CallIsActive:
-                    case NSUrlErrorExtended.DataNotAllowed:
-                        webExceptionStatus = WebExceptionStatus.ConnectFailure;
-                        break;
-                    case NSUrlErrorExtended.TimedOut:
-                        webExceptionStatus = WebExceptionStatus.Timeout;
-                        break;
-                    case NSUrlErrorExtended.CannotFindHost:
-                    case NSUrlErrorExtended.DNSLookupFailed:
-                        webExceptionStatus = WebExceptionStatus.NameResolutionFailure;
-                        break;
-                    case NSUrlErrorExtended.DataLengthExceedsMaximum:
-                        webExceptionStatus = WebExceptionStatus.MessageLengthLimitExceeded;
-                        break;
-                    case NSUrlErrorExtended.NetworkConnectionLost:
-                        webExceptionStatus = WebExceptionStatus.ConnectionClosed;
-                        break;
-                    case NSUrlErrorExtended.HTTPTooManyRedirects:
-                    case NSUrlErrorExtended.RedirectToNonExistentLocation:
-                        webExceptionStatus = WebExceptionStatus.ProtocolError;
-                        break;
-                    case NSUrlErrorExtended.RequestBodyStreamExhausted:
-                        webExceptionStatus = WebExceptionStatus.SendFailure;
-                        break;
-                    case NSUrlErrorExtended.BadServerResponse:
-                    case NSUrlErrorExtended.ZeroByteResource:
-                    case NSUrlErrorExtended.CannotDecodeRawData:
-                    case NSUrlErrorExtended.CannotDecodeContentData:
-                    case NSUrlErrorExtended.CannotParseResponse:
-                    case NSUrlErrorExtended.FileDoesNotExist:
-                    case NSUrlErrorExtended.FileIsDirectory:
-                    case NSUrlErrorExtended.NoPermissionsToReadFile:
-                    case NSUrlErrorExtended.CannotLoadFromNetwork:
-                    case NSUrlErrorExtended.CannotCreateFile:
-                    case NSUrlErrorExtended.CannotOpenFile:
-                    case NSUrlErrorExtended.CannotCloseFile:
-                    case NSUrlErrorExtended.CannotWriteToFile:
-                    case NSUrlErrorExtended.CannotRemoveFile:
-                    case NSUrlErrorExtended.CannotMoveFile:
-                    case NSUrlErrorExtended.DownloadDecodingFailedMidStream:
-                    case NSUrlErrorExtended.DownloadDecodingFailedToComplete:
-                        webExceptionStatus = WebExceptionStatus.ReceiveFailure;
-                        break;
-                    case NSUrlErrorExtended.SecureConnectionFailed:
-                        webExceptionStatus = WebExceptionStatus.SecureChannelFailure;
-                        break;
-                    case NSUrlErrorExtended.ServerCertificateHasBadDate:
-                    case NSUrlErrorExtended.ServerCertificateHasUnknownRoot:
-                    case NSUrlErrorExtended.ServerCertificateNotYetValid:
-                    case NSUrlErrorExtended.ServerCertificateUntrusted:
-                    case NSUrlErrorExtended.ClientCertificateRejected:
-                    case NSUrlErrorExtended.ClientCertificateRequired:
-                        webExceptionStatus = WebExceptionStatus.TrustFailure;
-                        break;
+                        case NSUrlErrorExtended.Cancelled:
+                        case NSUrlErrorExtended.UserCancelledAuthentication:
+                            // No more processing is required so just return.
+                            return new OperationCanceledException(error.LocalizedDescription, innerException);
+                        case NSUrlErrorExtended.BadURL:
+                        case NSUrlErrorExtended.UnsupportedURL:
+                        case NSUrlErrorExtended.CannotConnectToHost:
+                        case NSUrlErrorExtended.ResourceUnavailable:
+                        case NSUrlErrorExtended.NotConnectedToInternet:
+                        case NSUrlErrorExtended.UserAuthenticationRequired:
+                        case NSUrlErrorExtended.InternationalRoamingOff:
+                        case NSUrlErrorExtended.CallIsActive:
+                        case NSUrlErrorExtended.DataNotAllowed:
+                            webExceptionStatus = WebExceptionStatus.ConnectFailure;
+                            break;
+                        case NSUrlErrorExtended.TimedOut:
+                            webExceptionStatus = WebExceptionStatus.Timeout;
+                            break;
+                        case NSUrlErrorExtended.CannotFindHost:
+                        case NSUrlErrorExtended.DNSLookupFailed:
+                            webExceptionStatus = WebExceptionStatus.NameResolutionFailure;
+                            break;
+                        case NSUrlErrorExtended.DataLengthExceedsMaximum:
+                            webExceptionStatus = WebExceptionStatus.MessageLengthLimitExceeded;
+                            break;
+                        case NSUrlErrorExtended.NetworkConnectionLost:
+                            webExceptionStatus = WebExceptionStatus.ConnectionClosed;
+                            break;
+                        case NSUrlErrorExtended.HTTPTooManyRedirects:
+                        case NSUrlErrorExtended.RedirectToNonExistentLocation:
+                            webExceptionStatus = WebExceptionStatus.ProtocolError;
+                            break;
+                        case NSUrlErrorExtended.RequestBodyStreamExhausted:
+                            webExceptionStatus = WebExceptionStatus.SendFailure;
+                            break;
+                        case NSUrlErrorExtended.BadServerResponse:
+                        case NSUrlErrorExtended.ZeroByteResource:
+                        case NSUrlErrorExtended.CannotDecodeRawData:
+                        case NSUrlErrorExtended.CannotDecodeContentData:
+                        case NSUrlErrorExtended.CannotParseResponse:
+                        case NSUrlErrorExtended.FileDoesNotExist:
+                        case NSUrlErrorExtended.FileIsDirectory:
+                        case NSUrlErrorExtended.NoPermissionsToReadFile:
+                        case NSUrlErrorExtended.CannotLoadFromNetwork:
+                        case NSUrlErrorExtended.CannotCreateFile:
+                        case NSUrlErrorExtended.CannotOpenFile:
+                        case NSUrlErrorExtended.CannotCloseFile:
+                        case NSUrlErrorExtended.CannotWriteToFile:
+                        case NSUrlErrorExtended.CannotRemoveFile:
+                        case NSUrlErrorExtended.CannotMoveFile:
+                        case NSUrlErrorExtended.DownloadDecodingFailedMidStream:
+                        case NSUrlErrorExtended.DownloadDecodingFailedToComplete:
+                            webExceptionStatus = WebExceptionStatus.ReceiveFailure;
+                            break;
+                        case NSUrlErrorExtended.SecureConnectionFailed:
+                            webExceptionStatus = WebExceptionStatus.SecureChannelFailure;
+                            break;
+                        case NSUrlErrorExtended.ServerCertificateHasBadDate:
+                        case NSUrlErrorExtended.ServerCertificateHasUnknownRoot:
+                        case NSUrlErrorExtended.ServerCertificateNotYetValid:
+                        case NSUrlErrorExtended.ServerCertificateUntrusted:
+                        case NSUrlErrorExtended.ClientCertificateRejected:
+                        case NSUrlErrorExtended.ClientCertificateRequired:
+                            webExceptionStatus = WebExceptionStatus.TrustFailure;
+                            break;
                     }
 
                     goto done;
-                } 
+                }
 
                 if (error.Domain == CFNetworkError.ErrorDomain) {
                     // Convert the error code into an enumeration (this is future
@@ -471,107 +441,107 @@ namespace ModernHttpClient
                     // Apple docs: https://developer.apple.com/library/ios/documentation/Networking/Reference/CFNetworkErrors/#//apple_ref/c/tdef/CFNetworkErrors
                     // .NET docs: http://msdn.microsoft.com/en-us/library/system.net.webexceptionstatus(v=vs.110).aspx
                     switch (networkError) {
-                    case CFNetworkErrors.CFURLErrorCancelled:
-                    case CFNetworkErrors.CFURLErrorUserCancelledAuthentication:
-                    case CFNetworkErrors.CFNetServiceErrorCancel:
-                        // No more processing is required so just return.
-                        return new OperationCanceledException(error.LocalizedDescription, innerException);
-                    case CFNetworkErrors.CFSOCKS5ErrorBadCredentials:
-                    case CFNetworkErrors.CFSOCKS5ErrorUnsupportedNegotiationMethod:
-                    case CFNetworkErrors.CFSOCKS5ErrorNoAcceptableMethod:
-                    case CFNetworkErrors.CFErrorHttpAuthenticationTypeUnsupported:
-                    case CFNetworkErrors.CFErrorHttpBadCredentials:
-                    case CFNetworkErrors.CFErrorHttpBadURL:
-                    case CFNetworkErrors.CFURLErrorBadURL:
-                    case CFNetworkErrors.CFURLErrorUnsupportedURL:
-                    case CFNetworkErrors.CFURLErrorCannotConnectToHost:
-                    case CFNetworkErrors.CFURLErrorResourceUnavailable:
-                    case CFNetworkErrors.CFURLErrorNotConnectedToInternet:
-                    case CFNetworkErrors.CFURLErrorUserAuthenticationRequired:
-                    case CFNetworkErrors.CFURLErrorInternationalRoamingOff:
-                    case CFNetworkErrors.CFURLErrorCallIsActive:
-                    case CFNetworkErrors.CFURLErrorDataNotAllowed:
-                        webExceptionStatus = WebExceptionStatus.ConnectFailure;
-                        break;
-                    case CFNetworkErrors.CFURLErrorTimedOut:
-                    case CFNetworkErrors.CFNetServiceErrorTimeout:
-                        webExceptionStatus = WebExceptionStatus.Timeout;
-                        break;
-                    case CFNetworkErrors.CFHostErrorHostNotFound:
-                    case CFNetworkErrors.CFURLErrorCannotFindHost:
-                    case CFNetworkErrors.CFURLErrorDNSLookupFailed:
-                    case CFNetworkErrors.CFNetServiceErrorDNSServiceFailure:
-                        webExceptionStatus = WebExceptionStatus.NameResolutionFailure;
-                        break;
-                    case CFNetworkErrors.CFURLErrorDataLengthExceedsMaximum:
-                        webExceptionStatus = WebExceptionStatus.MessageLengthLimitExceeded;
-                        break;
-                    case CFNetworkErrors.CFErrorHttpConnectionLost:
-                    case CFNetworkErrors.CFURLErrorNetworkConnectionLost:
-                        webExceptionStatus = WebExceptionStatus.ConnectionClosed;
-                        break;
-                    case CFNetworkErrors.CFErrorHttpRedirectionLoopDetected:
-                    case CFNetworkErrors.CFURLErrorHTTPTooManyRedirects:
-                    case CFNetworkErrors.CFURLErrorRedirectToNonExistentLocation:
-                        webExceptionStatus = WebExceptionStatus.ProtocolError;
-                        break;
-                    case CFNetworkErrors.CFSOCKSErrorUnknownClientVersion:
-                    case CFNetworkErrors.CFSOCKSErrorUnsupportedServerVersion:
-                    case CFNetworkErrors.CFErrorHttpParseFailure:
-                    case CFNetworkErrors.CFURLErrorRequestBodyStreamExhausted:
-                        webExceptionStatus = WebExceptionStatus.SendFailure;
-                        break;
-                    case CFNetworkErrors.CFSOCKS4ErrorRequestFailed:
-                    case CFNetworkErrors.CFSOCKS4ErrorIdentdFailed:
-                    case CFNetworkErrors.CFSOCKS4ErrorIdConflict:
-                    case CFNetworkErrors.CFSOCKS4ErrorUnknownStatusCode:
-                    case CFNetworkErrors.CFSOCKS5ErrorBadState:
-                    case CFNetworkErrors.CFSOCKS5ErrorBadResponseAddr:
-                    case CFNetworkErrors.CFURLErrorBadServerResponse:
-                    case CFNetworkErrors.CFURLErrorZeroByteResource:
-                    case CFNetworkErrors.CFURLErrorCannotDecodeRawData:
-                    case CFNetworkErrors.CFURLErrorCannotDecodeContentData:
-                    case CFNetworkErrors.CFURLErrorCannotParseResponse:
-                    case CFNetworkErrors.CFURLErrorFileDoesNotExist:
-                    case CFNetworkErrors.CFURLErrorFileIsDirectory:
-                    case CFNetworkErrors.CFURLErrorNoPermissionsToReadFile:
-                    case CFNetworkErrors.CFURLErrorCannotLoadFromNetwork:
-                    case CFNetworkErrors.CFURLErrorCannotCreateFile:
-                    case CFNetworkErrors.CFURLErrorCannotOpenFile:
-                    case CFNetworkErrors.CFURLErrorCannotCloseFile:
-                    case CFNetworkErrors.CFURLErrorCannotWriteToFile:
-                    case CFNetworkErrors.CFURLErrorCannotRemoveFile:
-                    case CFNetworkErrors.CFURLErrorCannotMoveFile:
-                    case CFNetworkErrors.CFURLErrorDownloadDecodingFailedMidStream:
-                    case CFNetworkErrors.CFURLErrorDownloadDecodingFailedToComplete:
-                    case CFNetworkErrors.CFHTTPCookieCannotParseCookieFile:
-                    case CFNetworkErrors.CFNetServiceErrorUnknown:
-                    case CFNetworkErrors.CFNetServiceErrorCollision:
-                    case CFNetworkErrors.CFNetServiceErrorNotFound:
-                    case CFNetworkErrors.CFNetServiceErrorInProgress:
-                    case CFNetworkErrors.CFNetServiceErrorBadArgument:
-                    case CFNetworkErrors.CFNetServiceErrorInvalid:
-                        webExceptionStatus = WebExceptionStatus.ReceiveFailure;
-                        break;
-                    case CFNetworkErrors.CFURLErrorServerCertificateHasBadDate:
-                    case CFNetworkErrors.CFURLErrorServerCertificateUntrusted:
-                    case CFNetworkErrors.CFURLErrorServerCertificateHasUnknownRoot:
-                    case CFNetworkErrors.CFURLErrorServerCertificateNotYetValid:
-                    case CFNetworkErrors.CFURLErrorClientCertificateRejected:
-                    case CFNetworkErrors.CFURLErrorClientCertificateRequired:
-                        webExceptionStatus = WebExceptionStatus.TrustFailure;
-                        break;
-                    case CFNetworkErrors.CFURLErrorSecureConnectionFailed:
-                        webExceptionStatus = WebExceptionStatus.SecureChannelFailure;
-                        break;
-                    case CFNetworkErrors.CFErrorHttpProxyConnectionFailure:
-                    case CFNetworkErrors.CFErrorHttpBadProxyCredentials:
-                    case CFNetworkErrors.CFErrorPACFileError:
-                    case CFNetworkErrors.CFErrorPACFileAuth:
-                    case CFNetworkErrors.CFErrorHttpsProxyConnectionFailure:
-                    case CFNetworkErrors.CFStreamErrorHttpsProxyFailureUnexpectedResponseToConnectMethod:
-                        webExceptionStatus = WebExceptionStatus.RequestProhibitedByProxy;
-                        break;
+                        case CFNetworkErrors.CFURLErrorCancelled:
+                        case CFNetworkErrors.CFURLErrorUserCancelledAuthentication:
+                        case CFNetworkErrors.CFNetServiceErrorCancel:
+                            // No more processing is required so just return.
+                            return new OperationCanceledException(error.LocalizedDescription, innerException);
+                        case CFNetworkErrors.CFSOCKS5ErrorBadCredentials:
+                        case CFNetworkErrors.CFSOCKS5ErrorUnsupportedNegotiationMethod:
+                        case CFNetworkErrors.CFSOCKS5ErrorNoAcceptableMethod:
+                        case CFNetworkErrors.CFErrorHttpAuthenticationTypeUnsupported:
+                        case CFNetworkErrors.CFErrorHttpBadCredentials:
+                        case CFNetworkErrors.CFErrorHttpBadURL:
+                        case CFNetworkErrors.CFURLErrorBadURL:
+                        case CFNetworkErrors.CFURLErrorUnsupportedURL:
+                        case CFNetworkErrors.CFURLErrorCannotConnectToHost:
+                        case CFNetworkErrors.CFURLErrorResourceUnavailable:
+                        case CFNetworkErrors.CFURLErrorNotConnectedToInternet:
+                        case CFNetworkErrors.CFURLErrorUserAuthenticationRequired:
+                        case CFNetworkErrors.CFURLErrorInternationalRoamingOff:
+                        case CFNetworkErrors.CFURLErrorCallIsActive:
+                        case CFNetworkErrors.CFURLErrorDataNotAllowed:
+                            webExceptionStatus = WebExceptionStatus.ConnectFailure;
+                            break;
+                        case CFNetworkErrors.CFURLErrorTimedOut:
+                        case CFNetworkErrors.CFNetServiceErrorTimeout:
+                            webExceptionStatus = WebExceptionStatus.Timeout;
+                            break;
+                        case CFNetworkErrors.CFHostErrorHostNotFound:
+                        case CFNetworkErrors.CFURLErrorCannotFindHost:
+                        case CFNetworkErrors.CFURLErrorDNSLookupFailed:
+                        case CFNetworkErrors.CFNetServiceErrorDNSServiceFailure:
+                            webExceptionStatus = WebExceptionStatus.NameResolutionFailure;
+                            break;
+                        case CFNetworkErrors.CFURLErrorDataLengthExceedsMaximum:
+                            webExceptionStatus = WebExceptionStatus.MessageLengthLimitExceeded;
+                            break;
+                        case CFNetworkErrors.CFErrorHttpConnectionLost:
+                        case CFNetworkErrors.CFURLErrorNetworkConnectionLost:
+                            webExceptionStatus = WebExceptionStatus.ConnectionClosed;
+                            break;
+                        case CFNetworkErrors.CFErrorHttpRedirectionLoopDetected:
+                        case CFNetworkErrors.CFURLErrorHTTPTooManyRedirects:
+                        case CFNetworkErrors.CFURLErrorRedirectToNonExistentLocation:
+                            webExceptionStatus = WebExceptionStatus.ProtocolError;
+                            break;
+                        case CFNetworkErrors.CFSOCKSErrorUnknownClientVersion:
+                        case CFNetworkErrors.CFSOCKSErrorUnsupportedServerVersion:
+                        case CFNetworkErrors.CFErrorHttpParseFailure:
+                        case CFNetworkErrors.CFURLErrorRequestBodyStreamExhausted:
+                            webExceptionStatus = WebExceptionStatus.SendFailure;
+                            break;
+                        case CFNetworkErrors.CFSOCKS4ErrorRequestFailed:
+                        case CFNetworkErrors.CFSOCKS4ErrorIdentdFailed:
+                        case CFNetworkErrors.CFSOCKS4ErrorIdConflict:
+                        case CFNetworkErrors.CFSOCKS4ErrorUnknownStatusCode:
+                        case CFNetworkErrors.CFSOCKS5ErrorBadState:
+                        case CFNetworkErrors.CFSOCKS5ErrorBadResponseAddr:
+                        case CFNetworkErrors.CFURLErrorBadServerResponse:
+                        case CFNetworkErrors.CFURLErrorZeroByteResource:
+                        case CFNetworkErrors.CFURLErrorCannotDecodeRawData:
+                        case CFNetworkErrors.CFURLErrorCannotDecodeContentData:
+                        case CFNetworkErrors.CFURLErrorCannotParseResponse:
+                        case CFNetworkErrors.CFURLErrorFileDoesNotExist:
+                        case CFNetworkErrors.CFURLErrorFileIsDirectory:
+                        case CFNetworkErrors.CFURLErrorNoPermissionsToReadFile:
+                        case CFNetworkErrors.CFURLErrorCannotLoadFromNetwork:
+                        case CFNetworkErrors.CFURLErrorCannotCreateFile:
+                        case CFNetworkErrors.CFURLErrorCannotOpenFile:
+                        case CFNetworkErrors.CFURLErrorCannotCloseFile:
+                        case CFNetworkErrors.CFURLErrorCannotWriteToFile:
+                        case CFNetworkErrors.CFURLErrorCannotRemoveFile:
+                        case CFNetworkErrors.CFURLErrorCannotMoveFile:
+                        case CFNetworkErrors.CFURLErrorDownloadDecodingFailedMidStream:
+                        case CFNetworkErrors.CFURLErrorDownloadDecodingFailedToComplete:
+                        case CFNetworkErrors.CFHTTPCookieCannotParseCookieFile:
+                        case CFNetworkErrors.CFNetServiceErrorUnknown:
+                        case CFNetworkErrors.CFNetServiceErrorCollision:
+                        case CFNetworkErrors.CFNetServiceErrorNotFound:
+                        case CFNetworkErrors.CFNetServiceErrorInProgress:
+                        case CFNetworkErrors.CFNetServiceErrorBadArgument:
+                        case CFNetworkErrors.CFNetServiceErrorInvalid:
+                            webExceptionStatus = WebExceptionStatus.ReceiveFailure;
+                            break;
+                        case CFNetworkErrors.CFURLErrorServerCertificateHasBadDate:
+                        case CFNetworkErrors.CFURLErrorServerCertificateUntrusted:
+                        case CFNetworkErrors.CFURLErrorServerCertificateHasUnknownRoot:
+                        case CFNetworkErrors.CFURLErrorServerCertificateNotYetValid:
+                        case CFNetworkErrors.CFURLErrorClientCertificateRejected:
+                        case CFNetworkErrors.CFURLErrorClientCertificateRequired:
+                            webExceptionStatus = WebExceptionStatus.TrustFailure;
+                            break;
+                        case CFNetworkErrors.CFURLErrorSecureConnectionFailed:
+                            webExceptionStatus = WebExceptionStatus.SecureChannelFailure;
+                            break;
+                        case CFNetworkErrors.CFErrorHttpProxyConnectionFailure:
+                        case CFNetworkErrors.CFErrorHttpBadProxyCredentials:
+                        case CFNetworkErrors.CFErrorPACFileError:
+                        case CFNetworkErrors.CFErrorPACFileAuth:
+                        case CFNetworkErrors.CFErrorHttpsProxyConnectionFailure:
+                        case CFNetworkErrors.CFStreamErrorHttpsProxyFailureUnexpectedResponseToConnectMethod:
+                            webExceptionStatus = WebExceptionStatus.RequestProhibitedByProxy;
+                            break;
                     }
 
                     goto done;
@@ -585,7 +555,7 @@ namespace ModernHttpClient
             }
         }
     }
-            
+
     class ByteArrayListStream : Stream
     {
         Exception exception;
@@ -614,7 +584,7 @@ namespace ModernHttpClient
         public override void Flush() { }
 
         public override long Seek(long offset, SeekOrigin origin)
-        { 
+        {
             throw new NotSupportedException();
         }
 

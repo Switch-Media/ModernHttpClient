@@ -50,6 +50,7 @@
     <Compile Include="iOS\NativeCookieHandler.cs" />
     <Compile Include="iOS\CFNetworkErrors.cs" />
     <Compile Include="iOS\NSErrorExtended.cs" />
+    <Compile Include="CertificatePinner.cs" />
   </ItemGroup>
   <ItemGroup>
     <Folder Include="Properties\" />
