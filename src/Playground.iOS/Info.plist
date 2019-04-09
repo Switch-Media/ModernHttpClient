@@ -17,6 +17,8 @@
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>MinimumOSVersion</key>
-	<string>6.0</string>
+	<string>12.1</string>
+	<key>CFBundleName</key>
+	<string>Playground.iOS</string>
 </dict>
 </plist>
