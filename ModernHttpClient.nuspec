@@ -14,7 +14,7 @@
     <copyright>Copyright Paul Betts © 2012</copyright>
     <dependencies>
       <group targetFramework="MonoAndroid">
-        <dependency id="Square.OkHttp" version="2.4.0.3" />
+        <dependency id="Square.OkHttp3" version="3.8.1"/>
       </group>
     </dependencies>
   </metadata>
