@@ -7,3 +7,4 @@ build/
 *.xam
 packages
 .vs
+*Resource.designer.cs
